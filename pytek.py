@@ -51,15 +51,94 @@ def find_single_usb_scope(resource_manager):
     return usb_resources[0]
 
 
+def get_instrument_idn(scope):
+    return scope.query("*IDN?").strip()
+
+
 def read_bmp_hardcopy(scope):
     scope.timeout = 20000
     scope.write("HARDCOPY START")
     data = scope.read_raw()
+    return extract_bmp_payload(data)
 
-    if not data.startswith(b"BM"):
-        raise RuntimeError("HARDCOPY did not return a BMP file.")
 
-    return data
+def extract_bmp_payload(data):
+    if data.startswith(b"BM"):
+        return data
+
+    # Many VISA instruments wrap binary payloads in an IEEE 488.2 block:
+    # b"#" + <digits-count> + <payload-length> + <payload> [+ terminator]
+    if data.startswith(b"#") and len(data) >= 2:
+        digits_count = data[1] - ord("0")
+        if 0 <= digits_count <= 9 and len(data) >= 2 + digits_count:
+            payload_len_start = 2
+            payload_len_end = payload_len_start + digits_count
+            payload_len_raw = data[payload_len_start:payload_len_end]
+
+            if payload_len_raw.isdigit():
+                payload_len = int(payload_len_raw.decode("ascii"))
+                payload_start = payload_len_end
+                payload_end = payload_start + payload_len
+                payload = data[payload_start:payload_end]
+                if payload.startswith(b"BM"):
+                    return payload
+
+    bm_offset = data.find(b"BM")
+    if bm_offset != -1:
+        return data[bm_offset:]
+
+    raise RuntimeError("HARDCOPY did not return a BMP file.")
+
+
+def read_rigol_png_hardcopy(scope):
+    scope.timeout = 20000
+    scope.write(":DISPlay:DATA? ON,OFF,PNG")
+    data = scope.read_raw()
+    return extract_png_payload(data)
+
+
+def extract_png_payload(data):
+    png_signature = b"\x89PNG\r\n\x1a\n"
+
+    if data.startswith(png_signature):
+        return data
+
+    # Many instruments wrap binary payloads in an IEEE 488.2 block:
+    # b"#" + <digits-count> + <payload-length> + <payload> [+ terminator]
+    if data.startswith(b"#") and len(data) >= 2:
+        digits_count = data[1] - ord("0")
+        if 0 <= digits_count <= 9 and len(data) >= 2 + digits_count:
+            payload_len_start = 2
+            payload_len_end = payload_len_start + digits_count
+            payload_len_raw = data[payload_len_start:payload_len_end]
+
+            if payload_len_raw.isdigit():
+                payload_len = int(payload_len_raw.decode("ascii"))
+                payload_start = payload_len_end
+                payload_end = payload_start + payload_len
+                payload = data[payload_start:payload_end]
+                if payload.startswith(png_signature):
+                    return payload
+
+    png_offset = data.find(png_signature)
+    if png_offset != -1:
+        return data[png_offset:]
+
+    raise RuntimeError("HARDCOPY did not return a PNG file.")
+
+
+def capture_scope_image(scope):
+    idn = get_instrument_idn(scope)
+    idn_upper = idn.upper()
+
+    if "RIGOL" in idn_upper:
+        png_data = read_rigol_png_hardcopy(scope)
+        return png_data, "png", idn
+
+    # Keep the original Tektronix hardcopy flow as the default path.
+    bmp_data = read_bmp_hardcopy(scope)
+    png_data = bmp_to_png_bytes(bmp_data)
+    return png_data, "png", idn
 
 
 def make_png_chunk(chunk_type, chunk_data):
@@ -140,26 +219,35 @@ def bmp_to_png_bytes(bmp_data):
     )
 
 
-rm = pyvisa.ResourceManager()
-resource_name = find_single_usb_scope(rm)
+def main():
+    rm = pyvisa.ResourceManager()
+    try:
+        resource_name = find_single_usb_scope(rm)
 
-scope = rm.open_resource(resource_name)
-scope.timeout = 20000
-scope.chunk_size = 1024000
+        scope = rm.open_resource(resource_name)
+        scope.timeout = 20000
+        scope.chunk_size = 1024000
 
-try:
-    bmp_data = read_bmp_hardcopy(scope)
-finally:
-    scope.close()
+        try:
+            image_data, image_format, instrument_idn = capture_scope_image(scope)
+        finally:
+            scope.close()
 
-png_data = bmp_to_png_bytes(bmp_data)
-output_path = build_output_path()
+        output_path = build_output_path()
 
-with open(output_path, "wb") as f:
-    f.write(png_data)
+        with open(output_path, "wb") as f:
+            f.write(image_data)
 
-print(f"Connected: {resource_name}")
-print("Captured: BMP from oscilloscope")
-print("Converted: BMP -> PNG with lossless zlib compression")
-print(f"Saved: {output_path}")
-print("Done")
+        print(f"Connected: {resource_name}")
+        print(f"Instrument: {instrument_idn}")
+        print(f"Captured: {image_format.upper()} from oscilloscope")
+        if "TEKTRONIX" in instrument_idn.upper():
+            print("Converted: BMP -> PNG with lossless zlib compression")
+        print(f"Saved: {output_path}")
+        print("Done")
+    finally:
+        rm.close()
+
+
+if __name__ == "__main__":
+    main()
