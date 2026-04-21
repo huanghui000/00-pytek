@@ -105,17 +105,53 @@ def get_instrument_idn(scope):
     return scope.query("*IDN?").strip()
 
 
-def read_bmp_hardcopy(scope):
+def safe_query(scope, command):
+    original_timeout = scope.timeout
+    scope.timeout = 5000
+
+    try:
+        return scope.query(command).strip()
+    except Exception:
+        return None
+    finally:
+        scope.timeout = original_timeout
+
+
+def try_set_tektronix_hardcopy_format(scope, format_name):
+    commands = (
+        f"HARDCOPY:FORMAT {format_name}",
+        f"HCOPY:FORMAT {format_name}",
+    )
+
+    original_timeout = scope.timeout
+    scope.timeout = 5000
+
+    try:
+        for command in commands:
+            try:
+                scope.write(command)
+                return True, command
+            except Exception:
+                continue
+    finally:
+        scope.timeout = original_timeout
+
+    return False, None
+
+
+def request_tektronix_hardcopy_format(scope, format_name, capture_notes):
+    format_set, format_command = try_set_tektronix_hardcopy_format(scope, format_name)
+    return format_set
+
+
+def read_tektronix_hardcopy(scope):
     scope.timeout = 20000
     scope.write("HARDCOPY START")
     data = scope.read_raw()
-    return extract_bmp_payload(data)
+    return extract_image_payload(data)
 
 
-def extract_bmp_payload(data):
-    if data.startswith(b"BM"):
-        return data
-
+def extract_ieee4882_payload(data):
     # Many VISA instruments wrap binary payloads in an IEEE 488.2 block:
     # b"#" + <digits-count> + <payload-length> + <payload> [+ terminator]
     if data.startswith(b"#") and len(data) >= 2:
@@ -129,15 +165,43 @@ def extract_bmp_payload(data):
                 payload_len = int(payload_len_raw.decode("ascii"))
                 payload_start = payload_len_end
                 payload_end = payload_start + payload_len
-                payload = data[payload_start:payload_end]
-                if payload.startswith(b"BM"):
-                    return payload
+                return data[payload_start:payload_end]
 
-    bm_offset = data.find(b"BM")
-    if bm_offset != -1:
-        return data[bm_offset:]
+    return data
 
-    raise RuntimeError("HARDCOPY did not return a BMP file.")
+
+def detect_image_format(data):
+    if data.startswith(b"BM"):
+        return "bmp"
+
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+
+    return None
+
+
+def extract_image_payload(data):
+    payload = extract_ieee4882_payload(data)
+
+    format_name = detect_image_format(payload)
+    if format_name:
+        return payload, format_name
+
+    signatures = (
+        (b"BM", "bmp"),
+        (b"\x89PNG\r\n\x1a\n", "png"),
+        (b"\xff\xd8\xff", "jpg"),
+    )
+
+    for signature, format_name in signatures:
+        offset = payload.find(signature)
+        if offset != -1:
+            return payload[offset:], format_name
+
+    raise RuntimeError("HARDCOPY did not return a supported image file (BMP/PNG/JPG).")
 
 
 def read_rigol_png_hardcopy(scope):
@@ -153,26 +217,14 @@ def extract_png_payload(data):
     if data.startswith(png_signature):
         return data
 
-    # Many instruments wrap binary payloads in an IEEE 488.2 block:
-    # b"#" + <digits-count> + <payload-length> + <payload> [+ terminator]
-    if data.startswith(b"#") and len(data) >= 2:
-        digits_count = data[1] - ord("0")
-        if 0 <= digits_count <= 9 and len(data) >= 2 + digits_count:
-            payload_len_start = 2
-            payload_len_end = payload_len_start + digits_count
-            payload_len_raw = data[payload_len_start:payload_len_end]
+    payload = extract_ieee4882_payload(data)
 
-            if payload_len_raw.isdigit():
-                payload_len = int(payload_len_raw.decode("ascii"))
-                payload_start = payload_len_end
-                payload_end = payload_start + payload_len
-                payload = data[payload_start:payload_end]
-                if payload.startswith(png_signature):
-                    return payload
+    if payload.startswith(png_signature):
+        return payload
 
-    png_offset = data.find(png_signature)
+    png_offset = payload.find(png_signature)
     if png_offset != -1:
-        return data[png_offset:]
+        return payload[png_offset:]
 
     raise RuntimeError("HARDCOPY did not return a PNG file.")
 
@@ -180,15 +232,33 @@ def extract_png_payload(data):
 def capture_scope_image(scope):
     idn = get_instrument_idn(scope)
     idn_upper = idn.upper()
+    capture_notes = []
 
     if "RIGOL" in idn_upper:
         png_data = read_rigol_png_hardcopy(scope)
-        return png_data, "png", idn
+        return png_data, "png", idn, capture_notes
 
-    # Keep the original Tektronix hardcopy flow as the default path.
-    bmp_data = read_bmp_hardcopy(scope)
-    png_data = bmp_to_png_bytes(bmp_data)
-    return png_data, "png", idn
+    if "TEKTRONIX" in idn_upper:
+        save_image_settings = safe_query(scope, "SAVE:IMAGE?")
+        if save_image_settings:
+            capture_notes.append(f"Tek SAVE:IMAGE? => {save_image_settings}")
+
+        save_image_fileformat = safe_query(scope, "SAVE:IMAGE:FILEFORMAT?")
+        if save_image_fileformat:
+            capture_notes.append(f"Tek SAVE:IMAGE:FILEFORMAT? => {save_image_fileformat}")
+
+        request_tektronix_hardcopy_format(scope, "BMP", capture_notes)
+
+    # Tektronix models may return BMP, PNG, or JPG depending on hardcopy settings.
+    image_data, image_format = read_tektronix_hardcopy(scope)
+    if image_format == "bmp":
+        png_data = bmp_to_png_bytes(image_data)
+        return png_data, "png", idn, capture_notes
+
+    if "TEKTRONIX" in idn_upper and image_format != "bmp":
+        request_tektronix_hardcopy_format(scope, "PNG", capture_notes)
+
+    return image_data, image_format, idn, capture_notes
 
 
 def make_png_chunk(chunk_type, chunk_data):
@@ -279,11 +349,11 @@ def main():
         scope.chunk_size = 1024000
 
         try:
-            image_data, image_format, instrument_idn = capture_scope_image(scope)
+            image_data, image_format, instrument_idn, capture_notes = capture_scope_image(scope)
         finally:
             scope.close()
 
-        output_path = build_output_path()
+        output_path = build_output_path(image_format)
 
         with open(output_path, "wb") as f:
             f.write(image_data)
@@ -291,8 +361,8 @@ def main():
         print(f"Connected: {resource_name}")
         print(f"Instrument: {instrument_idn}")
         print(f"Captured: {image_format.upper()} from oscilloscope")
-        if "TEKTRONIX" in instrument_idn.upper():
-            print("Converted: BMP -> PNG with lossless zlib compression")
+        for capture_note in capture_notes:
+            print(capture_note)
         print(f"Saved: {output_path}")
         print("Done")
     finally:
