@@ -1,6 +1,8 @@
 import binascii
 from pathlib import Path
+import re
 import struct
+import subprocess
 from datetime import datetime
 import zlib
 
@@ -10,19 +12,60 @@ import pyvisa
 timestamp = datetime.now().strftime("%y%m%d%H%M%S")
 
 
-def build_output_path():
+def build_output_path(file_extension):
     base_name = f"SCOPE_{timestamp}"
-    candidate = Path(f"{base_name}.png")
+    candidate = Path(f"{base_name}.{file_extension}")
 
     if not candidate.exists():
         return str(candidate)
 
     suffix = 1
     while True:
-        candidate = Path(f"{base_name}_{suffix}.png")
+        candidate = Path(f"{base_name}_{suffix}.{file_extension}")
         if not candidate.exists():
             return str(candidate)
         suffix += 1
+
+
+def get_tektronix_usb_candidates_from_pnputil():
+    try:
+        output = subprocess.check_output(
+            ["pnputil", "/enum-devices", "/connected"],
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except Exception:
+        return []
+
+    candidates = []
+    current_instance_id = None
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Instance ID:"):
+            current_instance_id = stripped.split(":", 1)[1].strip()
+            continue
+
+        if not current_instance_id or not stripped.startswith("Device Description:"):
+            continue
+
+        device_description = stripped.split(":", 1)[1].strip()
+        match = re.match(r"USB\\VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})\\(.+)", current_instance_id)
+
+        if not match:
+            continue
+
+        vid, pid, serial = match.groups()
+        if vid.lower() != "0699":
+            continue
+
+        if "USB Test and Measurement Device" not in device_description:
+            continue
+
+        candidates.append(f"USB0::0x{vid.upper()}::0x{pid.upper()}::{serial}::INSTR")
+
+    return candidates
 
 
 def find_single_usb_scope(resource_manager):
@@ -43,6 +86,13 @@ def find_single_usb_scope(resource_manager):
         usb_resources.append(resource)
 
     if not usb_resources:
+        for resource in get_tektronix_usb_candidates_from_pnputil():
+            if resource in seen_resources:
+                continue
+            seen_resources.add(resource)
+            usb_resources.append(resource)
+
+    if not usb_resources:
         raise RuntimeError("No USB oscilloscope resource found.")
 
     if len(usb_resources) > 1:
@@ -51,15 +101,10 @@ def find_single_usb_scope(resource_manager):
     return usb_resources[0]
 
 
-def read_bmp_hardcopy(scope):
+def read_hardcopy(scope):
     scope.timeout = 20000
     scope.write("HARDCOPY START")
-    data = scope.read_raw()
-
-    if not data.startswith(b"BM"):
-        raise RuntimeError("HARDCOPY did not return a BMP file.")
-
-    return data
+    return scope.read_raw()
 
 
 def make_png_chunk(chunk_type, chunk_data):
@@ -148,18 +193,36 @@ scope.timeout = 20000
 scope.chunk_size = 1024000
 
 try:
-    bmp_data = read_bmp_hardcopy(scope)
+    image_data = read_hardcopy(scope)
 finally:
     scope.close()
 
-png_data = bmp_to_png_bytes(bmp_data)
-output_path = build_output_path()
+if image_data.startswith(b"BM"):
+    output_data = bmp_to_png_bytes(image_data)
+    output_extension = "png"
+    capture_format = "BMP"
+    saved_format = "PNG"
+elif image_data.startswith(b"\x89PNG\r\n\x1a\n"):
+    output_data = image_data
+    output_extension = "png"
+    capture_format = "PNG"
+    saved_format = "PNG"
+elif image_data.startswith(b"\xff\xd8\xff"):
+    output_data = image_data
+    output_extension = "jpg"
+    capture_format = "JPEG"
+    saved_format = "JPEG"
+else:
+    raise RuntimeError(f"Unsupported hardcopy format. File starts with: {image_data[:16]!r}")
+
+output_path = build_output_path(output_extension)
 
 with open(output_path, "wb") as f:
-    f.write(png_data)
+    f.write(output_data)
 
 print(f"Connected: {resource_name}")
-print("Captured: BMP from oscilloscope")
-print("Converted: BMP -> PNG with lossless zlib compression")
+print(f"Captured: {capture_format} from oscilloscope")
+if capture_format == "BMP" and saved_format == "PNG":
+    print("Converted: BMP -> PNG with lossless zlib compression")
 print(f"Saved: {output_path}")
 print("Done")
